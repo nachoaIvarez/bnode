@@ -1,0 +1,347 @@
+name: bnode
+
+# bnode — Bitcoin node stack
+#
+# Quick start:
+#   docker compose up -d
+#
+# Configuration: create a .env file or see .env.example
+#
+# All persistent data is stored under ${DATA_DIR}/bitcoin/:
+#   bitcoind/     - blockchain and wallet data
+#   tor/          - hidden service keys
+#   electrs/      - electrum server index
+#   mempool-api/  - mempool backend cache
+#   mempool-db/   - mariadb database
+#   secrets/      - auto-generated credentials
+
+services:
+  dashboard:
+    image: alpine:3.21
+    container_name: dashboard
+    restart: always
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "${DASHBOARD_PORT:-3110}:3110"
+    networks: [bnode]
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/secrets:/secrets
+      - ${DATA_DIR:-./data}/bitcoin/tor/bitcoin-p2p:/tor:ro
+      - ${DATA_DIR:-./data}/bitcoin/mempool-db:/mariadb-data
+      - ./dashboard:/dashboard:ro
+    environment:
+      - ENV_RPC_USER=${RPC_USER:-}
+      - ENV_RPC_PASSWORD=${RPC_PASSWORD:-}
+      - ENV_MYSQL_USER=${MYSQL_USER:-}
+      - ENV_MYSQL_PASSWORD=${MYSQL_PASSWORD:-}
+      - ENV_MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-}
+      - ELECTRUM_PORT=${ELECTRUM_PORT:-50001}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/secrets/.env"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+      start_period: 3s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # --- init secrets (128-bit entropy from /dev/urandom) ---
+        if [ ! -f /secrets/.env ]; then
+          RPC_USER=$${ENV_RPC_USER:-mempool}
+          RPC_PASS=$${ENV_RPC_PASSWORD:-$$(cat /dev/urandom | tr -dc a-f0-9 | head -c 32)}
+          DB_USER=$${ENV_MYSQL_USER:-mempool}
+          DB_PASS=$${ENV_MYSQL_PASSWORD:-$$(cat /dev/urandom | tr -dc a-f0-9 | head -c 32)}
+          DB_ROOT_PASS=$${ENV_MYSQL_ROOT_PASSWORD:-$$(cat /dev/urandom | tr -dc a-f0-9 | head -c 32)}
+          printf "RPC_USER=%s\nRPC_PASSWORD=%s\nMYSQL_USER=%s\nMYSQL_PASSWORD=%s\nMYSQL_ROOT_PASSWORD=%s\n" \
+            "$$RPC_USER" "$$RPC_PASS" "$$DB_USER" "$$DB_PASS" "$$DB_ROOT_PASS" > /secrets/.env
+          chmod 600 /secrets/.env
+          if [ -d /mariadb-data/mysql ]; then
+            rm -rf /mariadb-data/*
+            echo "Secrets regenerated. MariaDB data wiped (will re-index)."
+          else
+            echo "Secrets generated."
+          fi
+        else
+          echo "Secrets already exist, skipping."
+        fi
+
+        # --- install dependencies ---
+        apk add --no-cache su-exec curl jq busybox-extras > /dev/null 2>&1
+
+        # --- load secrets ---
+        . /secrets/.env
+        export RPC_USER RPC_PASSWORD ELECTRUM_PORT
+
+        # --- prepare web root ---
+        mkdir -p /www/api
+        cp /dashboard/index.html /www/index.html
+        cp /dashboard/health.sh /tmp/health.sh
+        chmod +x /tmp/health.sh
+        chown -R 65534:65534 /www /tmp
+
+        # --- start as nobody ---
+        exec su-exec nobody sh -c '
+          while true; do /tmp/health.sh; sleep 1; done &
+          echo "Dashboard available on port 3110"
+          exec httpd -f -p 3110 -h /www
+        '
+
+  tor:
+    image: osminogin/tor-simple:0.4.9.5
+    container_name: tor
+    restart: always
+    user: root
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+    networks: [bnode]
+    environment:
+      - EXPOSE_RPC_TOR=${EXPOSE_RPC_TOR:-false}
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/tor:/var/lib/tor
+    healthcheck:
+      test: ["CMD", "test", "-f", "/var/lib/tor/bitcoin-p2p/hostname"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        chmod -R 700 /var/lib/tor
+        printf "%s\n" \
+          "DataDirectory /var/lib/tor" \
+          "SocksPort 0.0.0.0:9050" \
+          "HiddenServiceDir /var/lib/tor/bitcoin-p2p" \
+          "HiddenServicePort ${P2P_PORT:-8333} 172.28.0.10:${P2P_PORT:-8333}" > /tmp/torrc
+        if [ "$$EXPOSE_RPC_TOR" = "true" ]; then
+          printf "%s\n" \
+            "HiddenServiceDir /var/lib/tor/bitcoin-rpc" \
+            "HiddenServicePort 8332 172.28.0.10:8332" >> /tmp/torrc
+        fi
+        exec tor -f /tmp/torrc
+
+  # Default node image: last Bitcoin Core release before the OP_RETURN
+  # controversy in v30. Change BITCOIND_IMAGE in .env to run whatever
+  # node software you prefer — see .env.example for alternatives.
+  bitcoind:
+    image: ${BITCOIND_IMAGE:-bitcoin/bitcoin:29.3}
+    container_name: bitcoind
+    restart: always
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+    ports:
+      - "${P2P_PORT:-8333}:${P2P_PORT:-8333}"
+    networks:
+      bnode:
+        ipv4_address: 172.28.0.10
+    environment:
+      - TOR_ONLY=${TOR_ONLY:-false}
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/bitcoind:/data/.bitcoin
+      - ${DATA_DIR:-./data}/bitcoin/tor/bitcoin-p2p:/tor-hidden-service:ro
+      - ${DATA_DIR:-./data}/bitcoin/secrets:/secrets:ro
+    depends_on:
+      dashboard:
+        condition: service_healthy
+      tor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          ". /secrets/.env && bitcoin-cli -rpcuser=$$RPC_USER -rpcpassword=$$RPC_PASSWORD uptime",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        . /secrets/.env
+        while [ ! -f /tor-hidden-service/hostname ]; do echo "Waiting for Tor hidden service..."; sleep 2; done
+        ONION=$$(cat /tor-hidden-service/hostname)
+        echo "Tor address: $$ONION"
+        ARGS="-datadir=/data/.bitcoin -server=1 -txindex=1 -port=${P2P_PORT:-8333} -rpcuser=$$RPC_USER -rpcpassword=$$RPC_PASSWORD -rpcbind=0.0.0.0 -rpcallowip=172.28.0.0/16 -listen=1 -externalip=$$ONION:${P2P_PORT:-8333}"
+        if [ "$$TOR_ONLY" = "true" ]; then
+          ARGS="$$ARGS -onlynet=onion -proxy=tor:9050"
+        else
+          ARGS="$$ARGS -onion=tor:9050"
+        fi
+        exec bitcoind $$ARGS
+
+  electrs:
+    image: getumbrel/electrs:v0.10.7
+    container_name: electrs
+    restart: on-failure
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+    ports:
+      - "${ELECTRUM_PORT:-50001}:${ELECTRUM_PORT:-50001}"
+    networks: [bnode]
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/electrs:/data/db
+      - ${DATA_DIR:-./data}/bitcoin/bitcoind:/data/.bitcoin:ro
+      - ${DATA_DIR:-./data}/bitcoin/secrets:/secrets:ro
+    depends_on:
+      dashboard:
+        condition: service_healthy
+      bitcoind:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "timeout 3 bash -c '</dev/tcp/127.0.0.1/${ELECTRUM_PORT:-50001}'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        . /secrets/.env
+        chown -R 1000:1000 /data/db
+        printf "auth=\"%s:%s\"\nelectrum_rpc_addr=\"0.0.0.0:${ELECTRUM_PORT:-50001}\"\ndaemon_rpc_addr=\"bitcoind:8332\"\ndaemon_p2p_addr=\"bitcoind:${P2P_PORT:-8333}\"\ndb_dir=\"/data/db\"\ndaemon_dir=\"/data/.bitcoin\"\nlog_filters=\"INFO\"\nnetwork=\"bitcoin\"\n" \
+          "$$RPC_USER" "$$RPC_PASSWORD" > /tmp/electrs.toml
+        export HOME=/tmp
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups -- electrs --conf /tmp/electrs.toml
+
+  web:
+    image: mempool/frontend:v3.2.1
+    container_name: mempool-web
+    restart: always
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:uid=1000,gid=1000
+      - /var/cache/nginx:uid=1000,gid=1000
+      - /var/run:uid=1000,gid=1000
+    networks: [bnode]
+    environment:
+      FRONTEND_HTTP_PORT: "8080"
+      BACKEND_MAINNET_HTTP_HOST: "api"
+    ports:
+      - "${MEMPOOL_PORT:-3109}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  api:
+    image: mempool/backend:v3.2.1
+    container_name: mempool-api
+    restart: always
+    user: "0:0"
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+    networks: [bnode]
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/mempool-api:/backend/cache
+      - ${DATA_DIR:-./data}/bitcoin/secrets:/secrets:ro
+    depends_on:
+      dashboard:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      bitcoind:
+        condition: service_healthy
+      electrs:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://127.0.0.1:8999/api/v1/backend-info || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        . /secrets/.env
+        chown -R 1000:1000 /backend/cache
+        export MEMPOOL_BACKEND=electrum
+        export CORE_RPC_HOST=bitcoind
+        export CORE_RPC_PORT=8332
+        export CORE_RPC_USERNAME=$$RPC_USER
+        export CORE_RPC_PASSWORD=$$RPC_PASSWORD
+        export ELECTRUM_HOST=electrs
+        export ELECTRUM_PORT=${ELECTRUM_PORT:-50001}
+        export ELECTRUM_TLS_ENABLED=false
+        export DATABASE_ENABLED=true
+        export DATABASE_HOST=db
+        export DATABASE_DATABASE=mempool
+        export DATABASE_USERNAME=$$MYSQL_USER
+        export DATABASE_PASSWORD=$$MYSQL_PASSWORD
+        export STATISTICS_ENABLED=true
+        exec setpriv --reuid=1000 --regid=1000 --clear-groups -- /backend/start.sh
+
+  db:
+    image: mariadb:10.5.21
+    container_name: mempool-db
+    restart: always
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+      - /run/mysqld
+    networks: [bnode]
+    volumes:
+      - ${DATA_DIR:-./data}/bitcoin/mempool-db:/var/lib/mysql
+      - ${DATA_DIR:-./data}/bitcoin/secrets:/secrets:ro
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          ". /secrets/.env && mysqladmin ping -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        . /secrets/.env
+        export MYSQL_DATABASE=mempool
+        export MYSQL_USER=$$MYSQL_USER
+        export MYSQL_PASSWORD=$$MYSQL_PASSWORD
+        export MYSQL_ROOT_PASSWORD=$$MYSQL_ROOT_PASSWORD
+        exec docker-entrypoint.sh mysqld
+
+networks:
+  bnode:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
