@@ -31,7 +31,7 @@ docker compose up -d
 
 ## Dashboard shows "unreachable"
 
-Normal during startup. The dashboard polls bitcoind's RPC every 10 seconds and updates automatically once the node is ready. This can take a few minutes after a cold start.
+Normal during startup. The dashboard polls bitcoind's RPC every second and updates automatically once the node is ready. This can take a few minutes after a cold start.
 
 ## Dashboard has startup latency
 
