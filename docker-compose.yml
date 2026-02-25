@@ -80,12 +80,12 @@ services:
         chmod +x /tmp/health.sh
         chown -R 65534:65534 /www /tmp
 
-        # --- start as nobody ---
-        exec su-exec nobody sh -c '
-          while true; do /tmp/health.sh; sleep 1; done &
-          echo "Dashboard available on port 3110"
-          exec httpd -f -p 3110 -h /www
-        '
+        # --- start health loop as root (needs to read /tor/hostname) ---
+        while true; do /tmp/health.sh; sleep 1; done &
+
+        # --- serve as nobody ---
+        echo "Dashboard available on port 3110"
+        exec su-exec nobody httpd -f -p 3110 -h /www
 
   tor:
     image: osminogin/tor-simple:0.4.9.5
@@ -112,6 +112,7 @@ services:
       - -c
       - |
         set -e
+        chown -R root:root /var/lib/tor
         chmod -R 700 /var/lib/tor
         printf "%s\n" \
           "DataDirectory /var/lib/tor" \
@@ -156,12 +157,12 @@ services:
       test:
         [
           "CMD-SHELL",
-          ". /secrets/.env && bitcoin-cli -rpcuser=$$RPC_USER -rpcpassword=$$RPC_PASSWORD uptime",
+          ". /secrets/.env && OUT=$$(bitcoin-cli -rpcuser=$$RPC_USER -rpcpassword=$$RPC_PASSWORD uptime 2>&1) || echo $$OUT | grep -q 'Loading'",
         ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 120s
+      start_period: 30s
     entrypoint:
       - /bin/sh
       - -c
