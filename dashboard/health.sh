@@ -17,17 +17,17 @@ if [ -z "$BTC_RAW" ]; then
   BTC_STATUS="unreachable"
   BTC_BLOCKS=0; BTC_HEADERS=0; BTC_PROGRESS=0; BTC_PEERS=0
   BTC_PEERS_IN=0; BTC_PEERS_OUT=0; BTC_MSG=""; BTC_CHAIN="n/a"
-  BTC_DIFFICULTY=0; BTC_SIZE=0
+  BTC_DIFFICULTY=0; BTC_SIZE=0; BTC_IBD=false
   MEM_TX=0; MEM_VSIZE=0; MEM_FEES=0
-  NET_HASHRATE=0; NET_VERSION=""; BTC_UPTIME=0
+  NET_HASHRATE=0; NET_VERSION=""; BTC_UPTIME=0; NET_TYPE=""
 elif echo "$BTC_RAW" | jq -e '.error != null' > /dev/null 2>&1; then
   BTC_MSG=$(echo "$BTC_RAW" | jq -r '.error.message // "unknown error"')
   BTC_STATUS="loading"
   BTC_BLOCKS=0; BTC_HEADERS=0; BTC_PROGRESS=0; BTC_PEERS=0
   BTC_PEERS_IN=0; BTC_PEERS_OUT=0; BTC_CHAIN="n/a"
-  BTC_DIFFICULTY=0; BTC_SIZE=0
+  BTC_DIFFICULTY=0; BTC_SIZE=0; BTC_IBD=false
   MEM_TX=0; MEM_VSIZE=0; MEM_FEES=0
-  NET_HASHRATE=0; NET_VERSION=""; BTC_UPTIME=0
+  NET_HASHRATE=0; NET_VERSION=""; BTC_UPTIME=0; NET_TYPE=""
 else
   BTC_BLOCKS=$(echo "$BTC_RAW" | jq -r '.result.blocks // 0')
   BTC_HEADERS=$(echo "$BTC_RAW" | jq -r '.result.headers // 0')
@@ -35,6 +35,7 @@ else
   BTC_CHAIN=$(echo "$BTC_RAW" | jq -r '.result.chain // "main"')
   BTC_DIFFICULTY=$(echo "$BTC_RAW" | jq -r '.result.difficulty // 0')
   BTC_SIZE=$(echo "$BTC_RAW" | jq -r '.result.size_on_disk // 0')
+  BTC_IBD=$(echo "$BTC_RAW" | jq -r '.result.initialblockdownload // false')
   BTC_MSG=""
 
   if [ "$BTC_BLOCKS" = "$BTC_HEADERS" ] && [ "$BTC_HEADERS" -gt 0 ] 2>/dev/null; then
@@ -58,6 +59,17 @@ else
   # network info
   NET_RAW=$(rpc getnetworkinfo)
   NET_VERSION=$(echo "$NET_RAW" | jq -r '.result.subversion // ""')
+  IPV4=$(echo "$NET_RAW" | jq -r '.result.networks[] | select(.name=="ipv4") | .reachable')
+  ONION_REACHABLE=$(echo "$NET_RAW" | jq -r '.result.networks[] | select(.name=="onion") | .reachable')
+  if [ "$IPV4" = "true" ] && [ "$ONION_REACHABLE" = "true" ]; then
+    NET_TYPE="clearnet+tor"
+  elif [ "$ONION_REACHABLE" = "true" ]; then
+    NET_TYPE="tor"
+  elif [ "$IPV4" = "true" ]; then
+    NET_TYPE="clearnet"
+  else
+    NET_TYPE=""
+  fi
 
   # hashrate (estimate from difficulty)
   NET_HASHRATE=$(echo "$BTC_DIFFICULTY" | awk '{printf "%.0f", $1 * 4295032833.0 / 600}')
@@ -131,7 +143,9 @@ cat > /www/api/health.json << JSONEOF
       "uptime": $BTC_UPTIME,
       "mempool_tx": $MEM_TX,
       "mempool_vsize": $MEM_VSIZE,
-      "mempool_fees": $MEM_FEES
+      "mempool_fees": $MEM_FEES,
+      "ibd": $BTC_IBD,
+      "network_type": "$NET_TYPE"
     },
     "electrs": { "status": "$ELECTRS_STATUS", "tip": $ELECTRS_TIP },
     "mempool": { "status": "$MEMPOOL_STATUS", "tip": $MEMPOOL_TIP },

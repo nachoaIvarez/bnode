@@ -76,6 +76,22 @@ body {
   animation: shimmer 2s ease-in-out infinite;
 }
 
+/* --- syncing state --- */
+
+@keyframes sync-glow {
+  0%, 100% { border-color: rgba(247, 147, 26, 0.1); }
+  50% { border-color: rgba(247, 147, 26, 0.3); }
+}
+
+.hero-card.is-syncing { animation: sync-glow 3s ease-in-out infinite; }
+
+.sync-pill-warn {
+  background: rgba(247, 147, 26, 0.1);
+  border: 1px solid rgba(247, 147, 26, 0.2);
+}
+.sync-pill-warn .sync-dot { background: var(--btc); }
+.sync-pill-warn .sync-text { color: var(--btc); }
+
 /* --- layout --- */
 
 .container {
@@ -235,13 +251,49 @@ header { margin-bottom: 2.5rem; }
 .hero-inner .metric-label { margin-bottom: 0.5rem; }
 
 .block-height {
+  font-family: var(--font-mono);
   font-size: 3rem;
   line-height: 1;
   font-weight: 900;
   color: white;
-  letter-spacing: -0.05em;
   font-variant-numeric: tabular-nums;
   animation: count-glow 3s ease-in-out infinite;
+}
+
+.dc {
+  display: inline-block;
+  position: relative;
+  overflow: hidden;
+  width: 1ch;
+  height: 1.3em;
+  vertical-align: top;
+  text-align: center;
+}
+
+.dc > span {
+  display: block;
+  height: 1.3em;
+  line-height: 1.3;
+}
+
+.dc > .out {
+  position: absolute;
+  inset: 0;
+  animation: digit-out 0.3s ease-in forwards;
+}
+
+.dc > .in {
+  animation: digit-in 0.3s ease-out forwards;
+}
+
+@keyframes digit-out {
+  from { transform: translateY(0); opacity: 1; }
+  to { transform: translateY(0.5em); opacity: 0; }
+}
+
+@keyframes digit-in {
+  from { transform: translateY(-0.5em); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
 }
 
 .sync-badge {
@@ -283,6 +335,7 @@ header { margin-bottom: 2.5rem; }
 .progress-blocks { font-size: 0.75rem; color: var(--night-100); font-variant-numeric: tabular-nums; }
 
 .progress-track {
+  position: relative;
   width: 100%; height: 0.625rem;
   background: rgba(22, 27, 34, 0.8);
   border-radius: 9999px;
@@ -290,10 +343,21 @@ header { margin-bottom: 2.5rem; }
 }
 
 .progress-bar {
+  position: relative;
   height: 100%;
   border-radius: 9999px;
   background: linear-gradient(to right, rgba(247, 147, 26, 0.7), var(--btc), var(--btc));
-  transition: all 1000ms;
+  transition: width 1000ms;
+}
+
+.progress-headers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: 9999px;
+  background: rgba(247, 147, 26, 0.15);
+  transition: width 1000ms;
 }
 
 .progress-remaining {
@@ -457,6 +521,7 @@ header { margin-bottom: 2.5rem; }
       </div>
       <div class="header-meta">
         <span id="chain-label" class="chain-label" style="display:none"></span>
+        <span id="net-type-label" class="chain-label" style="display:none"></span>
         <span id="uptime-label"></span>
       </div>
     </div>
@@ -504,6 +569,7 @@ header { margin-bottom: 2.5rem; }
           <span id="blocks-label" class="progress-blocks"></span>
         </div>
         <div class="progress-track">
+          <div id="hbar" class="progress-headers" style="width:0%"></div>
           <div id="pbar" class="progress-bar bar-glow progress-shimmer" style="width:0%"></div>
         </div>
         <div id="blocks-behind" class="progress-remaining"></div>
@@ -680,6 +746,52 @@ function renderStartup(d) {
   document.getElementById('boot-steps').innerHTML = steps;
 }
 
+var _publicTip = 0;
+
+function fetchPublicTip() {
+  fetch('https://mempool.space/api/blocks/tip/height')
+    .then(function(r) { return r.ok ? r.text() : null; })
+    .then(function(t) { if (t) _publicTip = parseInt(t, 10) || 0; })
+    .catch(function() {});
+}
+fetchPublicTip();
+setInterval(fetchPublicTip, 60000);
+
+var _prevBlockStr = '';
+
+function renderBlockHeight(el, str) {
+  var prev = _prevBlockStr;
+  _prevBlockStr = str;
+  if (str === prev) return;
+  var animate = prev && prev !== '---' && str !== '---';
+  var maxLen = Math.max(str.length, animate ? prev.length : 0);
+  var pOld = animate ? prev.padStart(maxLen) : '';
+  var pNew = str.padStart(maxLen);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < pNew.length; i++) {
+    var ch = pNew[i];
+    if (ch === ' ') continue;
+    var col = document.createElement('span');
+    col.className = 'dc';
+    var oldCh = pOld[i];
+    var diff = animate && oldCh !== ch;
+    if (diff && oldCh !== ' ') {
+      var out = document.createElement('span');
+      out.textContent = oldCh;
+      out.className = 'out';
+      out.addEventListener('animationend', function() { this.remove(); });
+      col.appendChild(out);
+    }
+    var dig = document.createElement('span');
+    dig.textContent = ch;
+    if (diff) dig.className = 'in';
+    col.appendChild(dig);
+    frag.appendChild(col);
+  }
+  while (el.firstChild) el.removeChild(el.firstChild);
+  el.appendChild(frag);
+}
+
 function render(d) {
   var b = d.services.bitcoind, el = d.services.electrs, mem = d.services.mempool,
       tor = d.services.tor, db = d.services.mariadb;
@@ -704,12 +816,24 @@ function render(d) {
   var cle = document.getElementById('chain-label');
   cle.textContent = cl; cle.style.display = cl ? '' : 'none';
   document.getElementById('uptime-label').textContent = b.uptime > 0 ? 'uptime ' + fmtUp(b.uptime) : '';
-  document.getElementById('block-height').textContent = (b.status === 'ok' || b.status === 'syncing') ? N(b.blocks) : '---';
+  var ntl = document.getElementById('net-type-label');
+  var ntMap = { 'clearnet+tor': 'CLEARNET + TOR', 'tor': 'TOR ONLY', 'clearnet': 'CLEARNET' };
+  var ntText = ntMap[b.network_type] || '';
+  ntl.textContent = ntText; ntl.style.display = ntText ? '' : 'none';
+  var showBlocks = b.status === 'ok' || b.status === 'syncing';
+  renderBlockHeight(document.getElementById('block-height'), showBlocks ? N(b.blocks) : '---');
 
   // sync state
   var ps = document.getElementById('progress-section'),
       sb = document.getElementById('sync-badge'), hs = document.getElementById('hero-shimmer');
   ps.classList.add('hidden'); sb.innerHTML = ''; hs.classList.add('hidden');
+  document.getElementById('hbar').style.width = '0%';
+  document.querySelector('.hero-card').classList.toggle('is-syncing', b.status === 'syncing');
+  if (b.status === 'syncing') {
+    sb.innerHTML = '<div class="sync-pill sync-pill-warn">' +
+      '<span class="sync-dot pulse-soft"></span>' +
+      '<span class="sync-text">syncing</span></div>';
+  }
 
   if (b.status === 'syncing' && b.blocks === 0) {
     ps.classList.remove('hidden'); hs.classList.remove('hidden');
@@ -719,12 +843,24 @@ function render(d) {
     pl.classList.add('pulse-soft');
     document.getElementById('blocks-label').textContent = b.headers > 0 ? N(b.headers) + ' headers' : 'connecting to peers...';
     document.getElementById('blocks-behind').textContent = 'block sync starts after headers finish';
+  } else if (b.status === 'syncing' && b.ibd) {
+    ps.classList.remove('hidden'); hs.classList.remove('hidden');
+    var tip = _publicTip || b.headers;
+    var ibdPct = tip > 0 ? (b.blocks / tip * 100) : 0;
+    var hdrPct = tip > 0 ? (b.headers / tip * 100) : 0;
+    document.getElementById('pbar').style.width = ibdPct.toFixed(2) + '%';
+    document.getElementById('hbar').style.width = hdrPct.toFixed(2) + '%';
+    var pl2 = document.getElementById('pct-label');
+    pl2.textContent = ibdPct.toFixed(2) + '%';
+    pl2.classList.remove('pulse-soft');
+    document.getElementById('blocks-label').textContent = _publicTip ? N(_publicTip) + ' tip' : N(b.headers) + ' headers';
+    document.getElementById('blocks-behind').textContent = N(b.blocks) + ' synced' + (_publicTip ? ' · ' + N(b.headers) + ' headers' : '');
   } else if (b.status === 'syncing') {
     ps.classList.remove('hidden'); hs.classList.remove('hidden');
     document.getElementById('pbar').style.width = pct.toFixed(2) + '%';
-    var pl2 = document.getElementById('pct-label');
-    pl2.textContent = pct.toFixed(2) + '%';
-    pl2.classList.remove('pulse-soft');
+    var pl3 = document.getElementById('pct-label');
+    pl3.textContent = pct.toFixed(2) + '%';
+    pl3.classList.remove('pulse-soft');
     document.getElementById('blocks-label').textContent = N(b.blocks) + ' / ' + N(b.headers);
     document.getElementById('blocks-behind').textContent = N(b.headers - b.blocks) + ' blocks remaining';
   } else if (b.status === 'ok') {
@@ -778,7 +914,8 @@ async function refresh() {
         bitcoind: { status: 'unreachable', blocks: 0, headers: 0, progress: 0, peers: 0,
           peers_inbound: 0, peers_outbound: 0, message: '',
           chain: 'n/a', difficulty: 0, hashrate: 0, size_on_disk: 0, version: '', uptime: 0,
-          mempool_tx: 0, mempool_vsize: 0, mempool_fees: 0 },
+          mempool_tx: 0, mempool_vsize: 0, mempool_fees: 0,
+          ibd: false, network_type: '' },
         electrs: { status: 'unreachable', tip: 0 },
         mempool: { status: 'unreachable', tip: 0 },
         tor: { status: 'unreachable', address: 'n/a' },
